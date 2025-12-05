@@ -1,15 +1,12 @@
 import os
 import logging
-import gzip
+import httpx # Usamos httpx em vez de requests, mais moderno
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from io import BytesIO
 
-# --- BIBLIOTECAS QUE REQUEREM LINUX (CAIRO/GTK) ---
-# Se rodar no Windows, vai quebrar; se rodar no servidor, vai funcionar!
-from lottie.parsers.svg import parse_svg_file
-from lottie.exporters.json_exporter import export_tgs # O caminho que funcionou no 0.6.0
-# Se o erro de 'json_exporter' retornar, tente 'from lottie.exporters.tgs import export_tgs'
+# --- API DE CONVERSÃO EXTERNA (Mais estável que as anteriores) ---
+CONVERSION_API_URL = "https://svg2tgs.tgstools.com/convert"
 
 # Configuração de Log
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -29,52 +26,60 @@ async def converter_svg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Aguarde enquanto convertemos... ⏳")
 
-    file_obj = await arquivo.get_file()
-    
-    # 1. Baixar o SVG e salvar no disco temporário
-    input_filename = f"temp_{user.id}.svg"
-    output_filename_tgs = f"sticker_{user.id}.tgs"
-    await file_obj.download_to_drive(input_filename)
-
     try:
-        # 2. Parsear SVG
-        animation = parse_svg_file(input_filename)
+        # 1. Obter o objeto do arquivo
+        file_obj = await arquivo.get_file()
+        
+        # 2. Baixar o conteúdo como bytes
+        # Usamos download_as_bytearray, que corrige o erro do início da conversa.
+        svg_bytes = await file_obj.download_as_bytearray()
+        
+        # 3. Enviar para a API externa
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            files = {'file': ('sticker.svg', svg_bytes, 'image/svg+xml')}
+            response = await client.post(CONVERSION_API_URL, files=files)
 
-        # 3. Exportar para TGS
-        # O export_tgs já faz o gzip e salva o arquivo
-        export_tgs(animation, output_filename_tgs)
-
-        # 4. Enviar de volta para o usuário
-        with open(output_filename_tgs, 'rb') as f:
+        # 4. Checar a resposta da API
+        if response.status_code == 200:
+            # A API retorna o arquivo TGS
+            tgs_bytes = response.content
+            
             await update.message.reply_document(
-                document=f,
-                filename=f"sticker.tgs",
+                document=tgs_bytes,
+                filename="sticker.tgs",
                 caption="Aqui está o seu sticker! 🚀"
+            )
+        else:
+            await update.message.reply_text(
+                f"Ocorreu um erro na conversão. Código de erro HTTP: {response.status_code}. "
+                f"Mensagem: {response.text[:100]}"
             )
 
     except Exception as e:
-        await update.message.reply_text(f"Ocorreu um erro na conversão. O SVG pode ser muito complexo ou ter recursos não suportados. Erro: {str(e)}")
-        print(f"Erro de Conversão: {e}")
-
-    finally:
-        # Limpeza
-        for f in [input_filename, output_filename_tgs]:
-            if os.path.exists(f):
-                os.remove(f)
+        await update.message.reply_text(
+            f"Ocorreu um erro ao conectar ao servidor de conversão. Tente novamente mais tarde. Erro: {type(e).__name__}: {str(e)}"
+        )
+        print(f"Erro de Conversão/Conexão: {e}")
 
 # --- INICIALIZAÇÃO ---
 
 def main():
-    # SUBSTITUA PELO SEU TOKEN AQUI
-    TOKEN = "8511876574:AAG4_Kw7YV5qbRf4VJiCoyv6Q3xCHQCGqD4"
+    # Garantindo que o TOKEN seja lido da variável de ambiente no Render
+    TOKEN = os.environ.get("TOKEN")
+
+    if not TOKEN:
+        # Se for rodar localmente, o TOKEN precisa ser definido aqui
+        # Para o Render, esta linha deve ser ignorada se o TOKEN for definido lá.
+        raise ValueError("Token do Telegram não encontrado. Defina a variável TOKEN no Render.")
     
     application = Application.builder().token(TOKEN).build()
-
+    
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.Document.ALL, converter_svg))
-
+    
     print("Bot rodando... Pressione Ctrl+C para parar.")
-    application.run_polling()
+    # Usamos run_polling() para ambientes simples como o Render
+    application.run_polling(poll_interval=10, timeout=15)
 
 if __name__ == '__main__':
     main()
